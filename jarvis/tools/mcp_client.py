@@ -42,6 +42,60 @@ def _result_text(result) -> str:
     return out or "(no output)"
 
 
+def _root_cause(exc: BaseException) -> BaseException:
+    """Dig the real exception out of asyncio's TaskGroup wrappers.
+
+    A server that dies on startup surfaces as an ExceptionGroup whose str() is
+    "unhandled errors in a TaskGroup" — the plumbing's name for the problem,
+    never the problem. The groups nest, too: stdio_client and ClientSession
+    each open one, so the cause sits two levels down. Siblings cancelled on the
+    way out ride along in the same group and are not the cause, so they are
+    stepped over while a real exception remains.
+
+    Duck-typed on `.exceptions` rather than `isinstance(exc, ExceptionGroup)`:
+    the builtin arrived in 3.11 and this package still supports 3.10.
+    """
+    subs = getattr(exc, "exceptions", None)
+    if not subs:
+        return exc
+    real = [s for s in subs if not isinstance(s, asyncio.CancelledError)] or list(subs)
+    return _root_cause(real[0])
+
+
+def _last_stderr_line(errlog_path: str | None) -> str:
+    """The server's own last word, from the per-server errlog.
+
+    "Connection closed" is true and useless; the reason it closed is one line
+    of the server's stderr, which we are already keeping. Read from the end —
+    a chatty server's log runs to megabytes and none of it but the tail
+    matters here.
+    """
+    if not errlog_path:
+        return ""
+    try:
+        with open(errlog_path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 4096))
+            tail = f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+    lines = [line.strip() for line in tail.splitlines() if line.strip()]
+    return lines[-1][:200] if lines else ""
+
+
+def _startup_error(exc: BaseException, errlog_path: str | None) -> str:
+    """One line naming why a server didn't come up, and where to read more."""
+    cause = _root_cause(exc)
+    text = " ".join(str(cause).split())      # one line, whatever the exception carried
+    message = f"{type(cause).__name__}: {text}" if text else type(cause).__name__
+    said = _last_stderr_line(errlog_path)
+    if said and said not in text:
+        message += f" — server said: {said}"
+    if errlog_path:
+        message += f" (full log: {errlog_path})"
+    return message
+
+
 class MCPClient:
     """A persistent connection to one MCP server, usable from sync code.
 
@@ -81,7 +135,8 @@ class MCPClient:
         if not self._ready.wait(timeout=timeout):
             raise TimeoutError(f"MCP server '{self.name}' did not start in time")
         if self._error:
-            raise self._error
+            raise RuntimeError(
+                _startup_error(self._error, self._errlog_path)) from self._error
 
     def _run(self) -> None:
         self._loop = asyncio.new_event_loop()
@@ -89,7 +144,11 @@ class MCPClient:
         self._stop = asyncio.Event()
         try:
             self._loop.run_until_complete(self._serve())
-        except Exception as e:            # startup/transport failure
+        except BaseException as e:        # startup/transport failure
+            # BaseException, not Exception: a task group holding a CancelledError
+            # stays a BaseExceptionGroup, which `except Exception` lets straight
+            # through. Nothing then sets _ready, so start() waits out its full
+            # timeout and blames the clock for what the server did.
             self._error = e
             self._ready.set()
         finally:
