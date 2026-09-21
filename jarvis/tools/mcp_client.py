@@ -14,6 +14,7 @@ read-only tool runs freely, anything else is gated behind confirmation.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import threading
 import time
@@ -55,14 +56,22 @@ def _root_cause(exc: BaseException) -> BaseException:
     Duck-typed on `.exceptions` rather than `isinstance(exc, ExceptionGroup)`:
     the builtin arrived in 3.11 and this package still supports 3.10.
     """
-    subs = getattr(exc, "exceptions", None)
-    if not subs:
-        return exc
-    real = [s for s in subs if not isinstance(s, asyncio.CancelledError)] or list(subs)
-    return _root_cause(real[0])
+    def leaves(current: BaseException):
+        subs = getattr(current, "exceptions", None)
+        if not subs:
+            yield current
+            return
+        for sub in subs:
+            yield from leaves(sub)
+
+    found = list(leaves(exc))
+    return next(
+        (leaf for leaf in found if not isinstance(leaf, asyncio.CancelledError)),
+        found[0],
+    )
 
 
-def _last_stderr_line(errlog_path: str | None) -> str:
+def _last_stderr_line(errlog_path: str | None, start_at: int = 0) -> str:
     """The server's own last word, from the per-server errlog.
 
     "Connection closed" is true and useless; the reason it closed is one line
@@ -75,7 +84,15 @@ def _last_stderr_line(errlog_path: str | None) -> str:
     try:
         with open(errlog_path, "rb") as f:
             f.seek(0, 2)
-            f.seek(max(0, f.tell() - 4096))
+            end = f.tell()
+            # A rotated/truncated log starts a new history, so its beginning is
+            # current. Otherwise, no bytes beyond start_at means this attempt
+            # said nothing — never recycle an older failure as today's cause.
+            if end < start_at:
+                start_at = 0
+            if end == start_at:
+                return ""
+            f.seek(max(start_at, end - 4096))
             tail = f.read().decode("utf-8", "replace")
     except OSError:
         return ""
@@ -83,12 +100,13 @@ def _last_stderr_line(errlog_path: str | None) -> str:
     return lines[-1][:200] if lines else ""
 
 
-def _startup_error(exc: BaseException, errlog_path: str | None) -> str:
+def _startup_error(exc: BaseException, errlog_path: str | None,
+                   stderr_start: int = 0) -> str:
     """One line naming why a server didn't come up, and where to read more."""
     cause = _root_cause(exc)
     text = " ".join(str(cause).split())      # one line, whatever the exception carried
     message = f"{type(cause).__name__}: {text}" if text else type(cause).__name__
-    said = _last_stderr_line(errlog_path)
+    said = _last_stderr_line(errlog_path, stderr_start)
     if said and said not in text:
         message += f" — server said: {said}"
     if errlog_path:
@@ -126,17 +144,24 @@ class MCPClient:
         self._session = None
         self._stop: asyncio.Event | None = None
         self._ready = threading.Event()
-        self._error: Exception | None = None
+        self._error: BaseException | None = None
+        self._stderr_start = 0
         self.tools: list = []       # raw MCP tool metadata
 
     def start(self, timeout: float = 30.0) -> None:
+        if self._errlog_path:
+            try:
+                self._stderr_start = os.path.getsize(self._errlog_path)
+            except OSError:
+                self._stderr_start = 0
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         if not self._ready.wait(timeout=timeout):
             raise TimeoutError(f"MCP server '{self.name}' did not start in time")
         if self._error:
             raise RuntimeError(
-                _startup_error(self._error, self._errlog_path)) from self._error
+                _startup_error(self._error, self._errlog_path,
+                               self._stderr_start)) from self._error
 
     def _run(self) -> None:
         self._loop = asyncio.new_event_loop()

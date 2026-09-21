@@ -43,6 +43,11 @@ class RootCauseTests(unittest.TestCase):
         group = _Group(asyncio.CancelledError(), err)
         self.assertIs(_root_cause(group), err)
 
+    def test_nested_cancelled_group_is_stepped_over(self):
+        err = PermissionError("bad credentials")
+        group = _Group(_Group(asyncio.CancelledError()), err)
+        self.assertIs(_root_cause(group), err)
+
 
 class StartupErrorTests(unittest.TestCase):
     def setUp(self):
@@ -68,14 +73,33 @@ class StartupErrorTests(unittest.TestCase):
         self.assertIn("401 Unauthorized", message)
         self.assertNotIn("full log", message)
 
+    def test_stderr_from_an_older_attempt_is_not_reused(self):
+        self.log.write_text("old failure: expired token\n")
+        start = self.log.stat().st_size
+        message = _startup_error(
+            _Group(FileNotFoundError("missing binary")), str(self.log), start
+        )
+        self.assertNotIn("expired token", message)
+
+    def test_only_current_attempts_stderr_is_reported(self):
+        self.log.write_text("old failure: expired token\n")
+        start = self.log.stat().st_size
+        with self.log.open("a") as stream:
+            stream.write("current failure: bad credentials\n")
+        message = _startup_error(
+            _Group(ConnectionError("Connection closed")), str(self.log), start
+        )
+        self.assertIn("current failure: bad credentials", message)
+        self.assertNotIn("expired token", message)
+
     def test_missing_log_is_not_an_error_of_its_own(self):
         self.assertEqual("", _last_stderr_line(str(self.log / "nope")))
         self.assertEqual("", _last_stderr_line(None))
 
 
 class _DeadClient(MCPClient):
-    def __init__(self, error):
-        super().__init__("broken")
+    def __init__(self, error, errlog_path=None):
+        super().__init__("broken", errlog_path=errlog_path)
         self._error_to_raise = error
 
     async def _serve(self):
@@ -95,6 +119,17 @@ class StartReportsTheCauseTests(unittest.TestCase):
         client = _DeadClient(_BaseGroup(asyncio.CancelledError()))
         with self.assertRaises(RuntimeError):
             client.start(timeout=5)
+
+    def test_start_does_not_report_stale_stderr(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "mcp-broken.log"
+            log.write_text("old failure: expired token\n")
+            client = _DeadClient(
+                _Group(ConnectionError("Connection closed")), str(log)
+            )
+            with self.assertRaises(RuntimeError) as caught:
+                client.start(timeout=5)
+            self.assertNotIn("expired token", str(caught.exception))
 
 
 if __name__ == "__main__":
